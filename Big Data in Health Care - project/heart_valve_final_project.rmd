@@ -1,0 +1,1016 @@
+---
+title: "Impianto di valvole cardiache: regressioni multiple di Cox a confronto"
+author: 
+     name: "Greta Gravina, Federico Pirola, Niccolò Rocchi"
+     affiliation: Università degli Studi di Milano-Bicocca, Milan, Italy
+date: "8 maggio 2023"
+output: 
+     rmdformats::robobook:
+          highlight: tango
+          fig_width: 6
+          fig_height: 6
+          use_bookdown: true
+
+---
+**Sommario**\
+Lo studio osservazionale che ha permesso la raccolta dei dati `heart_valve` riguarda pazienti che hanno subito un impianto di valvole cardiache. 
+Si vuole dunque indagare e modellare la sopravvivenza di questi pazienti, tramite una raccolta dati durata oltre 10 anni.\
+In particolare, si esamina il ruolo dell’indice di massa ventricolare sinistra sulla prognosi. 
+A questo scopo si sono costruiti due modelli di regressione multipla di Cox, uno base e uno aumentato. 
+Il modello aumentato differisce da quello base per il solo inserimento della variabile di indice di massa ventricolare sinistra.\
+ Successivamente alla validazione dei modelli e allo studio delle loro assunzioni di base, si è studiata la loro capacità predittiva del rischio, 
+ con un'attenzione particolare al beneficio che un modello aumentato può portare.
+
+# Dataset e preprocessing
+
+Variabili incluse nel dataset:
+
+• `Paz.id`: identificativo del paziente (stringa numerica)
+
+• `log.lvmi`: logaritmo naturale dell’indice di massa ventricolare sinistra misurato al basale. Questa variabile si presenta standardizzata.
+
+• `fuyrs`: tempo di follow-up dalla chirurgia (anni).
+
+• `status`: indicatore di evento (1 = morto; 0 = perso al follow-up).
+
+• `sex`: genere del paziente (0 = M; 1 = F).
+
+• `age`: età del paziente alla chirurgia (anni).
+
+• `con.cabg`: presenza concomitante di bypass coronarico (1 = si; 0 = no).
+
+• `creat`: creatinina serica pre-operatoria ($\frac{\mu \text{mol}}{\text{mL}}$).
+
+• `lv`: frazione di eiezione ventricolare sinistra pre-operatoria (1 = buona, 2 = moderata, 3 = scarsa).
+
+• `sten.reg.mix`: emodinamica della valvola aortica (1 = stenosi, 2 = rigurgito, 3 = misto).
+
+Cominciamo importando i pacchetti.
+```{r, warning=FALSE, message=FALSE}
+# Stimatore di Kaplan-Meier
+library(prodlim)
+
+# Stima dei modelli di Cox
+library(survival)
+
+# Librerie grafiche
+library(ggplot2)
+library(corrplot)
+
+# Inserimento di splines nei modelli
+library(splines)
+
+# Validazione dei modelli
+library(riskRegression)
+
+# Net Benefit Plot
+library(dcurves)
+
+# funzione plotHR
+library(Greg)
+
+# Clusters
+library(cluster)
+```
+
+Dopo avere importato i dati, esaminiamo i primi valori riportati nelle colonne.
+```{r}
+heart_valve <- read.table("data.txt",
+     na.strings = ".",
+     header = T, row.names = NULL
+)
+str(heart_valve)
+```
+
+Notiamo che alcune variabili non sono state automaticamente inserite come discrete, quindi proseguiamo manualmente.
+```{r}
+heart_valve$paz.id <- as.character(heart_valve$paz.id)
+heart_valve$sex <- factor(heart_valve$sex)
+heart_valve$con.cabg <- factor(heart_valve$con.cabg)
+heart_valve$lv <- factor(heart_valve$lv)
+heart_valve$sten.reg.mix <- factor(heart_valve$sten.reg.mix)
+```
+
+Inoltre vengono ricodificate in livelli le variabili continue.
+Questo ci permetterà di confrontarle con variabili discrete.
+Verranno scartate a favore di quelle originali, quando invece faranno parte dei regressori dei modelli.
+```{r}
+heart_valve$age_lev <- cut(heart_valve$age, breaks = c(0, 50, 65, 100))
+heart_valve$creat_lev <- cut(heart_valve$creat, breaks = c(0, 80, 120, 300))
+heart_valve$log.lvmi_lev <- cut(heart_valve$log.lvmi, breaks = c(3.5, 4.8, 5.2, 6.5))
+```
+
+# Analisi descrittive
+Proseguiamo ora con le analisi descrittive dei dati, partendo da semplici indici statistici riguardo le distribuzioni,
+e continuando con la loro visualizzazione.
+```{r}
+summary(heart_valve)
+```
+
+Notiamo che quasi l'$80\%$ dei soggetti in analisi sono persi al follow-up, mentre il restante $20\%$ circa presenta l'evento: 
+non sono quindi presenti soggetti censurati. 
+Tenendo in considerazione il lungo periodo durante il quale i pazienti vengono seguiti e il fatto che 
+soggetti che non presentano problemi post-operatori non vengano probabilmente controllati di frequente, 
+nel modellare la probabilità di sopravvivenza si assumono i soggetti persi al follow-up come right censored.
+
+```{r}
+ggplot(
+     heart_valve,
+     aes(x = as.factor(status), fill = as.factor(status))
+) +
+     geom_bar() +
+     scale_fill_hue(c = 40) +
+     theme(legend.position = "none") +
+     ggtitle("Distribuzione di evento") +
+     xlab("Evento") +
+     ylab("Frequenza assoluta")
+```
+
+Vediamo che il tempo di follow-up dei pazienti ha una distribuzione approssimativamente normale attorno alla media di 5 anni. 
+
+```{r}
+hist(heart_valve$fuyrs,
+     xlab = "Anni", ylab = "Frequenza assoluta",
+     main = "Distribuzione del tempo di follow-up"
+)
+```
+
+Si osservi che più della metà dei pazienti presentano una valvola aortica stenotica 
+e una frazione di eiezione ventricolare sinistra nella norma.
+Vi è anche una prevalenza di uomini nel campione.
+Questo è spiegabile dal fatto che, supponendo di avere un campione significativo,
+i problemi cardiaci e i conseguenti interventi alla valvola sono molto più predominanti negli uomini rispetto alle donne. 
+Inoltre, circa due terzi dei pazienti ha ricevuto un intervento con presenza concomitante di bypass coronario.
+
+```{r}
+par(mfrow = c(2, 2))
+
+barplot(table(heart_valve$sex),
+     main = "Genere paziente"
+)
+barplot(table(heart_valve$con.cabg),
+     main = "Presenza bypass coronarico"
+)
+barplot(table(heart_valve$lv),
+     main = "Fraz. eiezione ventricolare sinistra"
+)
+barplot(table(heart_valve$sten.reg.mix),
+     main = "Emodinamica valvola aortica"
+)
+```
+
+Come atteso l'età dei pazienti si concentra sulle fasce di popolazione più anziane, trattandosi di interventi cardiaci. 
+La variabile `log.lvmi` ha una distribuzione approssimativamente normale attorno alla media con alcuni valori estremi inferiori a 4 o superiori a 6.
+Il livello di creatinina serica pre-operatoria ha invece una distribuzione asimmetrica con una coda a destra. 
+I valori standard di creatina serica vanno tra i 65 e i 130 $\mu \text{mol}$ al millilitro, pertanto si riconoscono numerosi valori ben oltre le soglie adeguate, 
+con individui che superato addirittura i 200 $\mu \text{mol}$ al millilitro.
+
+```{r}
+par(mfrow = c(1, 3))
+
+hist(heart_valve$log.lvmi,
+     xlab = "Left Ventricular Mass Index",
+     main = "Log Left Ventricular Mass Index"
+)
+hist(heart_valve$age,
+     xlab = "Anni",
+     main = "Età del paziente"
+)
+hist(heart_valve$creat,
+     xlab = "Creatina serica",
+     main = "Creatinina serica"
+)
+```
+
+Ora, sempre a livello descrittivo, viene riprodotta la funzione di sopravvivenza nel tempo per la totalità dei soggetti.
+Si evince che la sopravvivenza di un paziente che ha subito un impianto di valvole cardiache a 5 anni dall'operazione 
+è dell'$80\%$, mentre dopo 10 anni è poco superiore al $50\%$. 
+```{r}
+fit.surv <- prodlim(Hist(fuyrs, status) ~ 1,
+     data = heart_valve
+)
+plot(fit.surv)
+```
+
+
+Studiando ora la presenza concomitante di bypass coronario, scopriamo che questo porta ad una sopravvivenza
+significativamente inferiore sulla quasi totalità del periodo di 10 anni.
+```{r}
+fit.surv_cc <- prodlim(Hist(fuyrs, status) ~ con.cabg,
+     data = heart_valve
+)
+plot(fit.surv_cc,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+
+Anche la frazione di eiezione ventricolare sinistra pre-operatoria sembra essere un fattore di forte impatto 
+sulla sopravvivenza degli individui successivamente all'inserimento della valvola. 
+Risulta una differenza significativa nella sopravvivenza tra pazienti con un buon livello di eiezione ventricolare sinistra 
+e quelli con una frazione scarsa della stessa a partire da 3 anni dall'intervento subito.
+```{r}
+fit.surv_lv <- prodlim(Hist(fuyrs, status) ~ lv,
+     data = heart_valve
+)
+plot(fit.surv_lv,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+
+Non vi è tuttavia una differenza di genere significativa su tutto il periodo di follow-up.
+```{r}
+fit.surv_lv <- prodlim(Hist(fuyrs, status) ~ sex,
+     data = heart_valve
+)
+plot(fit.surv_lv,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+La frazione di eiezione ventricolare sinistra pre-operatoria sembra presentare un impatto minore sulla sopravvivenza 
+dei pazienti, anche se le code sembrano avere delle differenze significative 
+in termini di probabilità di sopravvivenza.
+Tuttavia, va ricordato che il basso numero di pazienti a rischio, nelle code, rende le analisi non attendibili.
+```{r}
+fit.surv_lv <- prodlim(Hist(fuyrs, status) ~ sten.reg.mix,
+     data = heart_valve
+)
+plot(fit.surv_lv,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+Suddividendo ora i soggetti in analisi in classi di età è evidente come la sopravvivenza degli over 65 
+sia significativamente inferiore a quella nei soggetti più giovani. 
+Non si evidenziano invece differenze significative per i soggetti under 50 e per quelli tra i 50 e i 65 anni.
+```{r}
+fit.surv_age <- prodlim(Hist(fuyrs, status) ~ age_lev,
+     data = heart_valve
+)
+plot(fit.surv_age,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+Soggetti con un livello di creatina elevato ($\geq 120$) presentano una probabilità di sopravvivenza inferiore 
+nel lungo periodo, ovvero dopo circa 6 anni di follow-up. 
+Tuttavia la differenza non sembra essere sostanziale e la scarsità di soggetti seguiti dopo 8 anni dall'intervento 
+alla valvola non consente di giungere a delle conclusioni.
+```{r}
+fit.surv_creat <- prodlim(Hist(fuyrs, status) ~ creat_lev,
+     data = heart_valve
+)
+plot(fit.surv_creat,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+Anche il logaritmo dell’indice di massa ventricolare sinistra sembra presentare una relazione significativa con la 
+sopravvivenza dei pazienti.
+In particolare, al crescere di tale valore si ha una probabilità di sopravvivenza decrescente.
+```{r}
+fit.surv_creat <- prodlim(Hist(fuyrs, status) ~ log.lvmi_lev,
+     data = heart_valve
+)
+plot(fit.surv_creat,
+     legend = TRUE,
+     legend.x = 0.2, legend.y = 0.4, legend.cex = 0.8
+)
+```
+
+
+Infine notiamo che non è presente una forte correlazione tra le variabili continue, 
+il che scoraggerebbe l'inserimento congiunto delle stesse in un modello predittivo. 
+Si procede pertanto costruendo i modelli di Cox per tutte le covariate.
+```{r}
+nums <- unlist(lapply(heart_valve, is.numeric), use.names = FALSE)
+corrplot(cor(heart_valve[, nums]),
+     method = "color", order = "alphabet"
+)
+```
+
+# Analisi univariate
+Dal modello di Cox costruito per valutare l'associazione tra `log.lvmi` e la sopravvivenza, 
+emerge che è presente un coefficiente $\beta = 0.91 > 0$ e di conseguenza un aumento unitario 
+del logaritmo dell’indice di massa 
+ventricolare sinistra aumenta l'hazard ratio, in particolare del $148\%$.\
+La differenza è significativa al $5\%$. Di norma, appunto, si considera 
+un valore di significatività $\alpha = 0.05$ nelle analisi cliniche.
+
+```{r}
+model1 <- coxph(
+     formula = Surv(fuyrs, status) ~ log.lvmi,
+     data = heart_valve
+)
+summary(model1)
+```
+
+Nel seguente modello si vuole testare l'associazione tra il genere e la sopravvivenza. 
+Si nota che è presente un coefficiente $\beta = 0.21 > 0$ e di conseguenza il sesso 
+femminile sembra tradursi in una prognosi peggiore, precisamente del $23\%$.\
+Tuttavia il coefficiente non è significativo.
+
+```{r}
+model2 <- coxph(
+     formula = Surv(fuyrs, status) ~ sex,
+     data = heart_valve
+)
+summary(model2)
+```
+Dall'analisi univariata dell'associazione tra la sopravvivenza e la covariata `age`, 
+si osserva che il coefficiente $\beta = 0.10$ è positivo, 
+comportando un aumento del rischio di evento all'aumentare dell'età.
+Ogni anno di età incrementa l'hazard ratio dell'$11\%$.\
+La differenza tuttavia è significativa.
+
+```{r}
+model3 <- coxph(
+     formula = Surv(fuyrs, status) ~ age,
+     data = heart_valve
+)
+summary(model3)
+```
+Nel presente modello di Cox, implementato per testare l'associazione tra `con.cabg` e la sopravvivenza,
+si nota che è presente un coefficiente $\beta = 0.96$. Se dunque un soggetto selezionato in modo randomico ha presenza concomitante di 
+bypass coronarico, questo ha velocità di evento maggiore di circa il $162\%$ rispetto a chi non ce l'ha.\
+La differenza è infatti significativa.
+
+```{r}
+model4 <- coxph(
+     formula = Surv(fuyrs, status) ~ con.cabg,
+     heart_valve
+)
+summary(model4)
+```
+Con la seguente analisi si nota che è presente un coefficiente $\beta = 0.01$ per la creatina,
+e di conseguenza un aumento unitario peggiora leggermente la prognosi.\
+La differenza è significativa al $5\%$.
+
+```{r}
+model5 <- coxph(
+     formula = Surv(fuyrs, status) ~ creat,
+     data = heart_valve
+)
+summary(model5)
+```
+Dall'analisi univariata dell'associazione tra sopravvivenza e la covariata `lv`, 
+si osserva che una frazione di eiezione ventricolare sinistra pre-operatoria 
+scarsa implica un hazard ratio triplo rispetto ad una frazione di eiezione buona.\
+Quest'ultimo risultato risulta significativo, al contrario del confronto 
+tra i primi due livelli di eiezione.
+ 
+
+```{r}
+model6 <- coxph(
+     formula = Surv(fuyrs, status) ~ factor(lv),
+     data = heart_valve
+)
+summary(model6)
+```
+
+Nel testare l'associazione tra sopravvivenza e l'emodinamica della 
+valvola aortica, si nota un $\beta = -0.86$. Concludiamo affermando che la covariata diminuisce la velocità di 
+evento. 
+Se un soggetto selezionato randomicamente ha come emodinamica il rigurgito (`sten.reg.mix` = 2), 
+allora la prognosi è migliore del $58\%$ rispetto ad un individuo con emodinamica di stenosi. 
+rispetto a chi ha emodinamica di stenosi. 
+Il successivo confronto non risulta però significativo.
+```{r}
+model7 <- coxph(
+     formula = Surv(fuyrs, status) ~ factor(sten.reg.mix),
+     data = heart_valve
+)
+summary(model7)
+```
+
+# Modelli multivariati di Cox
+## Modello di Cox base
+Lo sviluppo del modello predittivo base prevede l'inserimento dei seguenti regressori: `sex`, `age`, `con.cabg`, 
+`creat`, `lv`,  `sten.reg.mix`
+
+Le variabili significative, date dal modello di Cox base sono:
+* L'età
+* La presenza concomitante di bypass coronarico
+* La frazione di eiezione ventricolare sinistra pre-operatoria
+
+Un aumento di età, la presenza concomitante di bypass coronarico e di una scarsa frazione di 
+eiezione ventricolare sinistra pre-operatoria accrescono la velocità di evento. 
+Per esempio, al netto delle altre variabili, abbiamo un aumento del $10\%$ di hazard ad ogni anno in più di età.
+
+```{r}
+model_base <- coxph(
+     formula = Surv(fuyrs, status) ~ sex + age + con.cabg + creat + factor(lv) + factor(sten.reg.mix),
+     data = heart_valve,
+     x = T
+)
+summary(model_base)
+```
+
+## Valutazione di PH e linearità
+Dalla verifica dell'assunzione di linearità della variabile `age` 
+sembra che l'aumento della velocità di evento con l'accrescere dell'età dei pazienti sia costante nel tempo. 
+Infatti, attraverso la rappresentazione grafica dei Martingale Residuals, 
+non si osserva un trend persistente e si può quindi supporre che l'effetto sull'hazard sia costante
+all'aumentare dell'età. 
+Si trova conferma di questo fatto anche dalla visualizzazione del modello di Cox implementato 
+con una b-spline per la variabile `age`: anche in questo caso si osserva che l'età ha un effetto pressoche 
+lineare sui log-hazard e che la curva ha un andamento complessivamente costante man mano che aumenta la
+densità della variabile `age`. 
+
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+mar.res <- resid(model_base, type = "martingale")
+
+plot(heart_valve$age, mar.res,
+     xlab = "age", ylab = "Martingale Residuals",
+     main = "Check functional form of age"
+)
+
+lines(lowess(heart_valve$age, mar.res), col = "red")
+model.age.bs <- coxph(Surv(fuyrs, status) ~ bs(age, 4),
+     data = heart_valve
+)
+
+par(mar = c(4, 4, 1, 1))
+
+plotHR(model.age.bs,
+     term = "age", plot.bty = "o", ylog = T, xlim = c(30, 100),
+     rug = "density", xlab = "age", polygon_ci = T
+)
+```
+
+Per quanto riguarda il controllo sulla linearità della variabile `creat`, 
+sembra non ci sia un andamento complessivamente lineare dei residui. 
+Ciò potrebbe essere dovuto al fatto che nel modello di Cox, questa non sia una variabile significativa. 
+Tuttavia, dalla rappresentazione grafica Martingale Residuals, non si osserva un netto trend dei residui 
+quindi si può supporre che l'effetto sull'hazard sia tendenzialmente costante all'aumentare della creatina. 
+Osservando meglio la forma funzionale della variabile continua sul grafico del modello di Cox implementato 
+con una b-spline per la variabile `creat`, 
+si osserva un andamento lineare della curva per valori alti di densità della variabile.
+
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+mar.res <- resid(model_base, type = "martingale")
+plot(heart_valve$creat, mar.res,
+     xlab = "creat", ylab = "Martingale Residuals",
+     main = "Check functional form of creatine"
+)
+
+lines(lowess(heart_valve$creat, mar.res), col = "green")
+model.creat.bs <- coxph(Surv(fuyrs, status) ~ bs(creat, 4),
+     data = heart_valve
+)
+
+par(mar = c(4, 4, 1, 1))
+
+plotHR(model.creat.bs,
+     term = "creat", plot.bty = "o", ylog = T, xlim = c(30, 100),
+     rug = "density", xlab = "creat", polygon_ci = T
+)
+```
+
+Dai grafici per i residui di Schoenfeld sembra si possa assumere PH per la variabile `sex` in quanto 
+l'andamento dei residui è orizzontale, mentre si necessita di un'ulteriore controllo sull'uniformità dei residui 
+della variabile `con.cabg`.
+
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+checkPH.sex <- cox.zph(model_base)[1]
+plot(checkPH.sex, main = "Check PH assumption of sex")
+points(checkPH.sex$x, checkPH.sex$y, pch = 16, col = "red")
+abline(h = 0, lty = 2, col = 2)
+
+checkPH.con_cabg <- cox.zph(model_base)[3]
+plot(checkPH.con_cabg, main = "Check PH assumption of con.cabg")
+points(checkPH.con_cabg$x, checkPH.con_cabg$y, pch = 16, col = "red")
+abline(h = 0, lty = 2, col = 2)
+```
+
+Dal controllo grafico della PH assumption implementato invece calcolando la stima K-M nei diversi livelli 
+della variabile categorica `con.cabg`, si può assumere, seppur con incertezza, 
+PH per tale variabile. 
+Infatti i logaritmi $\log(-\log(S_X(t)))$ e $\log(-\log(S_0(t)))$  si mantengano 
+approssimativamente ad una distanza 
+costante nel tempo, e non sussiste un cambio di inversione di 
+pendenza per le due classi nel tempo. 
+Tuttavia, nonostante si nutrono dubbi circa questa assunzione, si ricorda la non 
+significatività di `con.cabg`.
+
+```{r}
+km.con.cabg <- survfit(Surv(fuyrs, status) ~ con.cabg,
+     data = heart_valve
+)
+plot(km.con.cabg,
+     col = c("black", "red"), fun = "cloglog",
+     ylab = "log(-log(Survival))", xlab = "log(time)",
+     main = "Check PH assumption of con.cabg"
+)
+```
+
+Anche in questo caso la rappresentazione dei residui di Schoenfeld ci permette di assumere PH 
+sia per `lv` che per  `sten.reg.mix`: i residui hanno trend orizzontale e non dipendono dal tempo.
+
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+checkPH.lv <- cox.zph(model_base)[5]
+plot(checkPH.lv, main = "Check PH assumption of lv")
+points(checkPH.lv$x, checkPH.lv$y, pch = 16, col = "red")
+abline(h = 0, lty = 2, col = 2)
+
+checkPH.sten <- cox.zph(model_base)[6]
+plot(checkPH.sten, main = "Check PH assumption of sten reg")
+points(checkPH.sten$x, checkPH.sten$y, pch = 16, col = "red")
+abline(h = 0, lty = 2, col = 2)
+```
+
+## Modello di Cox aumentato
+Lo sviluppo del modello predittivo aumentato prevede l'inserimento dei seguenti regressori: `sex`, `age`, `con.cabg`, 
+`creat`, `lv`,  `sten.reg.mix` e `log.lvmi`.
+Come descritto in precedenza, il modello di Cox aumentato differisce dal modello base per il solo inserimento aggiuntivo
+del logaritmo naturale dell’indice di massa ventricolare sinistra. 
+La statistica del test di Wald è superiore a quella del modello base, 
+pertanto da un'analisi preliminare sembra esserci un miglioramento.
+
+```{r}
+model_augmented <- coxph(
+     formula = Surv(fuyrs, status) ~ log.lvmi + sex + age + con.cabg + creat + lv + sten.reg.mix,
+     data = heart_valve, x = T
+)
+summary(model_augmented)
+```
+
+
+Dai test di Wald sulle singole covariate risultano significative per spiegare l'azzardo:
+* Il logaritmo dell'indice di massa ventricolare
+* L'età 
+* La presenza di bypass coronario concomitante.
+
+Inoltre, al crescere di `log.lvmi`, al netto delle altre covariate, si ha un aumento dell'hazard ratio 
+e di conseguenza un peggioramento della prognosi. 
+Lo stesso vale per l'età: individui più anziani avranno una prognosi peggiore e una conseguente probabilità di 
+sopravvivenza minore rispetto ad individui più giovani.\
+Inoltre, individui che presentano un bypass coronario concomitante avranno un hazard ratio superiore 
+e una probabilità di sopravvivenza più bassa.
+
+Si sottolinea inoltre che vi è una netto contributo alla previsione dell'azzardo dato dalla frazione di eiezione ventricolare 
+sinistra e dall'emodinamica della valvola aortica. 
+Nello specifico, un individuo con un livello moderato o scarso della frazione di eiezione ventricolare sinistra 
+avrà una probabilità di sopravvivenza nel tempo inferiore rispetto ad un individuo con un buon livello, 
+a parità di altri fattori. Viceversa, una valvola aortica mista rispetto ad una valvola stenotica ha un effetto 
+negativo sull'azzardo e conseguentemente, a parità degli altri fattori, la prognosi per un individuo con valvola aortica 
+mista sarà migliore.
+
+Il genere e il livello di creatina serica non risultano invece significativi nello spiegare la variabilità dell'azzardo.
+
+## Valutazione di PH e linearità
+Dal seguente test sui residui di Schoenfeld, l'ipotesi di Proportional Hazard 
+sembra verificata per tutte le variabili discrete.
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+checkPH.kar <- cox.zph(model_augmented)
+checkPH.kar
+```
+
+Si procede con l'analisi grafica delle distribuzioni dei residui di Schoenfeld per le variabili categoriali e dei 
+residui di Martingale per le variabili continue.
+
+La stima dei parametri $\mathbf{\beta}$ tempo dipendenti per le variabili genere, frazione di eiezione ventricolare sinistra 
+ed emodinamica della valvola aortica, evidenziano un andamento approssimativamente costante nel tempo.
+Si ha pertanto un'ulteriore conferma circa la validità dell'assunzione di azzardo proporzionale per queste variabili.
+Per quanto concerne il parametro tempo dipendente del modello di Cox relativo alla presenza concomitante di 
+bypass coronario, si osserva un andamento non costante che porta a dubitare di un azzardo proporzionale nel tempo. 
+```{r}
+# sex
+par(mfrow = c(2, 2))
+
+plot(checkPH.kar[2], main = "Check PH assumption of sex")
+points(checkPH.kar[2]$x, checkPH.kar[2]$y, pch = 16, col = "lightgray")
+abline(h = 0, lty = 2, col = 2)
+
+# con.cabg
+plot(checkPH.kar[4], main = "Check PH assumption of con.cabg")
+points(checkPH.kar[4]$x, checkPH.kar[4]$y, pch = 16, col = "green")
+abline(h = 0, lty = 2, col = 2)
+
+# sten.reg.mix
+plot(checkPH.kar[7], main = "Check PH assumption of sten.reg.mix")
+points(checkPH.kar[7]$x, checkPH.kar[7]$y, pch = 16, col = "red")
+abline(h = 0, lty = 2, col = 2)
+
+# lv
+plot(checkPH.kar[6], main = "Check PH assumption of lv")
+points(checkPH.kar[6]$x, checkPH.kar[6]$y, pch = 16, col = "blue")
+abline(h = 0, lty = 2, col = 2)
+```
+
+Tuttavia, tramite analisi grafica della distanza dei logaritmi delle due curve di sopravvivenza, 
+possiamo assumere che valga PH anche in questo caso.
+```{r}
+km.con.cabg <- survfit(Surv(fuyrs, status) ~ strata(con.cabg), data = heart_valve)
+plot(km.con.cabg,
+     col = c("black", "red"), fun = "cloglog",
+     ylab = "log(-log(Survival))", xlab = "log(time)",
+     main = "Check PH assumption of con.cabg"
+)
+```
+
+I residui di Martingale per `log.lvmi` presentano una media decrescente nel tempo.
+Inoltre la forma funzionale dell'hazard ratio per tale variabile non è lineare, ma parabolica.
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+km.log.lvmi <- coxph(Surv(fuyrs, status) ~ log.lvmi,
+     data = heart_valve
+)
+
+mar.res <- resid(km.log.lvmi, type = "martingale")
+plot(heart_valve$log.lvmi, mar.res,
+     xlab = "log.lvmi", ylab = "Martingale Residuals",
+     main = "Check functional form of log.lvmi"
+)
+
+lines(lowess(heart_valve$log.lvmi, mar.res), col = "red")
+
+model.kar.bs <- coxph(Surv(fuyrs, status == 1) ~ bs(log.lvmi, 4),
+     data = heart_valve
+)
+
+plotHR(model.kar.bs,
+     term = "log.lvmi", plot.bty = "o",
+     xlim = c(0, 10), xlab = "log.lvmi"
+)
+```
+
+Non potendo confermare l'ipotesi di linearità, 
+si potrebbe sostituire nel modello il logaritmo di `log.lvmi` alla variabile stessa.
+Infatti, la curva dell'hazard ratio tramite splines di `log.lvmi` sembra avere un andamento logaritmico.
+Tuttavia, dal grafico dei Martingale Residuals e da quello del nuovo hazard ratio, 
+in funzione della variabile `log.log.lvmi`, non si notano cambiamenti rilevanti.\
+D'altra parte, la variabile `log.log.lvmi` risulterebbe anche di difficile 
+interpretazione in un modello di regressione.
+```{r}
+# Nuova variabile: log(log.lvmi)
+heart_valve$log.log.lvmi <- log(heart_valve$log.lvmi)
+
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+km.log.log.lvmi <- coxph(Surv(fuyrs, status) ~ log.log.lvmi,
+     data = heart_valve
+)
+
+mar.res <- resid(km.log.log.lvmi, type = "martingale")
+plot(heart_valve$log.log.lvmi, mar.res,
+     xlab = "log.log.lvmi", ylab = "Martingale Residuals",
+     main = "Check functional form of log.log.lvmi"
+)
+lines(lowess(heart_valve$log.log.lvmi, mar.res), col = "red")
+
+model.log.bs <- coxph(Surv(fuyrs, status == 1) ~ bs(log.log.lvmi, 4),
+     data = heart_valve
+)
+
+plotHR(model.log.bs,
+     term = "log.log.lvmi", plot.bty = "o",
+     xlim = c(0, 10), xlab = "log.log.lvmi"
+)
+```
+
+I residui di Martingale per l'età si distribuiscono in modo approssimativamente casuale attorno alla media, 
+con una leggera differenza per individui molto anziani. 
+La distribuzione dell'Hazard Ratio ottenuta con il metodo delle splines evidenzia linearità, 
+tenendo anche in considerazione la distribuzione d'età del campione di riferimento. 
+L'ipotesi è dunque confermata.
+```{r}
+km.age <- coxph(Surv(fuyrs, status) ~ age,
+     data = heart_valve
+)
+
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+mar.res_age <- resid(km.age, type = "martingale")
+plot(heart_valve$age, mar.res_age,
+     xlab = "age", ylab = "Martingale Residuals",
+     main = "Check functional form of age"
+)
+lines(lowess(heart_valve$age, mar.res_age), col = "red")
+
+model.age.bs <- coxph(Surv(fuyrs, status == 1) ~ bs(age, 4),
+     data = heart_valve
+)
+plotHR(model.age.bs,
+     term = "age", plot.bty = "o",
+     xlim = c(0, 400), xlab = "age"
+)
+```
+
+Anche i residui di Martingale per la variabile `creat` si distribuiscono in modo approssimativamente casuale attorno alla media. 
+Inoltre l'andamento dell'Hazard Ratio nell'intervallo di livello di creatina ad alta concentrazione è 
+indicativamente lineare.\
+Si ha pertanto evidenza di linearità anche per il livello di creatina serica pre-operatoria.
+
+```{r}
+km.creat <- coxph(Surv(fuyrs, status) ~ creat,
+     data = heart_valve
+)
+
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+mar.res_creat <- resid(km.creat, type = "martingale")
+plot(heart_valve$creat, mar.res_creat,
+     xlab = "creat", ylab = "Martingale Residuals",
+     main = "Check functional form of creatine"
+)
+lines(lowess(heart_valve$creat, mar.res_creat), col = "red")
+
+model.creat.bs <- coxph(Surv(fuyrs, status == 1) ~ bs(creat, 4),
+     data = heart_valve
+)
+plotHR(model.creat.bs,
+     term = "creat", plot.bty = "o",
+     xlim = c(0, 400), xlab = "creat"
+)
+```
+
+
+# Validazione e confronto
+Per iniziare, istanziamo il numero di anni di cui siamo interessati a prevedere il rischio. In questo caso è 5.
+```{r}
+N <- 5
+```
+
+Calcoliamo poi la sopravvivenza predetta dai due modelli, e stimiamo il rischio di morte entro 5 anni per ogni paziente.
+```{r}
+# Sopravvivenza di ogni paziente, per ogni modello
+fit_base <- survfit(model_base, newdata = heart_valve)
+fit_augmented <- survfit(model_augmented, newdata = heart_valve)
+
+# Rischio di morte entro 5 anni
+heart_valve$risk_of_death_base <- 1 - as.numeric(summary(fit_base, times = N)$surv)
+heart_valve$risk_of_death_augmented <- 1 - as.numeric(summary(fit_augmented, times = N)$surv)
+```
+
+Ora, calcoliamo gli score necessari per la costruzione di indici grafici 
+di valutazione dei modelli.
+In particolare, siamo interessati alla loro calibrazione e discriminazione.\
+Per quanto riguarda la calibrazione, testiamo in particolare la Weak Calibration, sfruttando il Calibration Plot e il Brier Score.
+Tale indice numerico è successivamente confrontato con lo stesso indice calcolato nell'ipotesi di Strong Calibration.\
+Per quanto riguarda invece la discriminazione, osserviamo il comportamento delle due curve ROC.
+Da esse si può poi estrarre l'indice di area sotto la curva, ovvero l'AUC, e valutarne la differenza.
+Infine, esploriamo anche come le AUC si comportano nel tempo per ognuno dei due modelli.
+
+Sfruttiamo quindi la libreria `riskRegression` per calcolare gli score necessari alle analisi.
+Calcoliamo questi score per ogni tempo, da 1 a 5. Non contiamo i tempi successivi, 
+per confinare la nostra domanda di ricerca ad 
+un orizzonte temporale limitato, ma anche 
+per la poca affidabilità dovuta alla numerosità campionaria.\
+Si noti che si non si usa un procedimento di Cross-Validation,
+incompatibile con il calcolo della ROC curve nel pacchetto `riskRegression`.
+
+```{r}
+score <- Score(list("base" = model_base, "augmented" = model_augmented),
+     formula = Surv(fuyrs, status) ~ 1,
+     data = heart_valve,
+     times = 1:N, plots = c("cal", "roc", "auc"), summary = "risks"
+)
+```
+
+## Calibrazione
+Dal Calibration Plot notiamo comportamenti simili tra i due modelli, in termini di rischi stimati. 
+Benchè correlati tra loro, entrambi sovrastimano il rischio nelle classi di pazienti selezionate da alte soglie di rischio.
+In generale, l'atteggiamento dei modelli è quindi di prudenza: d'altra parte avremmo uno svantaggio per i pazienti se i modelli
+sottostimassero il rischio.\
+Da un'analisi più approfondita si nota che precedentemente al valore di soglia del $35\%$ il modello aumentato 
+sottostima il rischio, mentre dopo tale soglia lo sovrastima.
+
+```{r, warning=FALSE}
+# Calibration plot at 5 years
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 2))
+
+plotCalibration(score,
+     times = N, type = "p",
+     auc.in.legend = F, brier.in.legend = F,
+     cens.method = "local",
+     col = c("#08519c", "#86bff9")
+)
+```
+
+Notiamo che anche i Brier Score sono coerenti tra loro, con un valore attorno a $0.35$.
+Tralasciando il loro valore assoluto ma confrontandoli con i Brier Score calcolati nell'ipotesi di Strong Calibration,
+osserviamo che non sono molto simili tra loro.\
+Il modello che in generale ha la migliore calibrazione è il modello base,
+con previsioni più vicine alla diagonale del quadrante del Calibration Plot.
+```{r}
+# Indicatore di evento entro 5 anni
+heart_valve$event.Ny <- ifelse(heart_valve$fuyrs <= N, 1, 0)
+
+# Brier Score
+BS_base <- mean((heart_valve$event.Ny - heart_valve$risk_of_death_base)^2)
+BS_augmented <- mean((heart_valve$event.Ny - heart_valve$risk_of_death_augmented)^2)
+print(c("BS_base: ", round(BS_base, digits = 3)))
+print(c("BS_augmented: ", round(BS_augmented, digits = 3)))
+
+# Brier Score sotto l'ipotesi di Strong Calibration
+BS_base_sc <- mean(heart_valve$risk_of_death_base * (1 - heart_valve$risk_of_death_base))
+BS_augmented_sc <- mean(heart_valve$risk_of_death_augmented * (1 - heart_valve$risk_of_death_augmented))
+
+# Si comparano i Brier Score osservati con quelli attesi sotto Strong Calibration
+print(c("BS_base - BS_base_sc: ", round(BS_base - BS_base_sc, digits = 3)))
+print(c("BS_augmented - BS_augmented_sc: ", round(BS_augmented - BS_augmented_sc, digits = 3)))
+```
+
+## Discriminazione
+
+Proseguiamo le analisi tramite curve ROC e Youden Index.\
+La curva ROC del modello aumentato è superiore a quella del modello base solo per soglie di rischio 
+meno stringenti, e quindi per una frazione di popolazione 
+più ampia. Il modello base, al contrario, ha una miglior curva per soglie più stringenti.\
+Le due AUC, seppur vicine, sottolineano comunque un leggero vantaggio per il modello aumentato.
+
+```{r}
+# ROC curve a 5 anni
+plotROC(score,
+     times = N, xlab = "FPR", ylab = "TPR",
+     col = c("#08519c", "#86bff9")
+)
+```
+
+Calcoliamo ora le soglie ottimali secondo lo Youden Index. Notiamo che la soglia ottima 
+del modello aumentato è, come ci aspettiamo, più ampia: sceglie di classificare come a 
+rischio i pazienti con un rischio superiore all'$11\%$, 
+in confronto al $30\%$ del modello base. 
+
+```{r}
+# Dati delle curve ROC di ogni modello
+roc <- score$ROC$plotframe |> data.frame()
+roc <- roc[roc$times == N, ]
+roc_base <- roc[roc$model == "base", ]
+roc_augmented <- roc[roc$model == "augmented", ]
+
+# Youden indices
+Youden_base <- roc_base$TPR - roc_base$FPR
+Youden_augmented <- roc_augmented$TPR - roc_augmented$FPR
+
+# Soglie ottimali
+opt_cutoff_base <- roc_base$risk[Youden_base == max(Youden_base)]
+opt_cutoff_augmented <- roc_augmented$risk[Youden_augmented == max(Youden_augmented)]
+
+print(c("Optimal cut off base model ", round(opt_cutoff_base, digits = 3)))
+print(c("Optimal cut off augmented ", round(opt_cutoff_augmented, digits = 3)))
+
+# Plot delle soglie sopra le curve ROC
+plotROC(score,
+     times = N, xlab = "FPR", ylab = "TPR",
+     col = c("#08519c", "#86bff9")
+)
+
+points(roc_base$FPR[Youden_base == max(Youden_base)],
+     roc_base$TPR[Youden_base == max(Youden_base)],
+     pch = 22, cex = 1.7, bg = "#08519c"
+)
+
+points(roc_augmented$FPR[Youden_augmented == max(Youden_augmented)],
+     roc_augmented$TPR[Youden_augmented == max(Youden_augmented)],
+     pch = 22, cex = 1.7, bg = "#86bff9"
+)
+```
+
+La curva AUC relativa al secondo modello sovrasta, di poco, quella del primo modello: 
+ne segue dunque una maggior capacità discriminante all'aumentare dell'orizzonte temporale.
+```{r}
+# AUC
+plotAUC(score,
+     which = "score",
+     col = c("#08519c", "#86bff9")
+)
+```
+
+Proviamo ora ad interpretare il Net Benefit Plot.\
+E' proprio intorno ad un $35\%$ di soglia che troviamo la maggiore differenza tra i benefici, 
+a favore del modello base.
+Intorno a questa soglia abbiamo un plateau delle curve di beneficio, con un vantaggio per il modello base.
+Il modello aumentato appare migliore a basse soglie.
+
+```{r, warning=FALSE}
+# Net benefit al tempo 5
+dca(Surv(fuyrs, status) ~ risk_of_death_base + risk_of_death_augmented,
+     data = heart_valve, time = N
+)
+```
+
+In conclusione, la scelta del modello clinico da adottare può dipendere da vari fattori.
+Per una maggiore prudenza, che si traduce in una sovrastima del rischio e soglie ottimali più basse, 
+si preferisce il modello aumentato. Adottando questo modello, si mette in secondo piano il costo di 
+miclassificare pazienti non a rischio come a rischio.\
+Se, al contrario, si mette in primo piano il costo ed il valore di ottenere
+un modello più calibrato, si scelga il modello base. Infatti, 
+nello scenario in cui i soggetti predetti a rischio vengono 
+sottoposti a un trattamento di un certo costo, si preferisce 
+adottare un modello più stringente.
+
+# Previsione del rischio
+
+Si vuole prevedere il rischio di evento ad un time-point fisso, per tre soggetti tipo.
+Per l'individuazione di 3 soggetti tipo, si fa affidamento ad una tecnica di clustering. 
+L'idea di base dell'algoritmo `K-means` si traduce, nel caso di variabili miste, nell'algoritmo `K-medoids`.
+Si cerca dunque di clusterizzare il sample di pazienti in 3 gruppi, e di estrarre successivamente
+le osservazioni centrali. \
+La metrica di distanza usata è quella di Gower, come suggerito dalla letteratura.
+
+```{r}
+# Data matrix per il clustering, escludendo le variabili: id paziente, tempo di evento e status
+data_matrix <- heart_valve[, c(2, 5, 6, 7, 8, 9, 10)]
+
+# Matrice di distanza (gower distance)
+gower_distance_matrix <- as.matrix(daisy(data_matrix, metric = "gower"))
+
+# K-medoids clustering, con 3 centri
+n_centers <- 3
+clusters <- pam(gower_distance_matrix, n_centers,
+     metric = "euclidean",
+     medoids = "random",
+     nstart = 10
+)
+
+# Estraiamo i centri dall'output del clustering
+subjects_id <- as.vector(clusters$id.med)
+subjects <- data_matrix[subjects_id, ]
+
+# Esplorazione delle variabili dei 3 pazienti
+cbind(subjects_id, subjects)
+```
+
+I seguenti risultati rappresentano i rischi dei 3 soggetti a 5 anni. 
+Il modello base ottiene rischi nettamente maggiori.
+
+```{r}
+# Stimiamo il rischio di morte dei 3 soggetti a 5 anni
+for (i in 1:n_centers) {
+     fit1 <- survfit(model_base, newdata = subjects[i, ])$surv
+     fit2 <- survfit(model_augmented, newdata = subjects[i, ])$surv
+
+     risk_N_base <- 1 - fit1[249 / max(heart_valve$fuyrs) * N]
+     risk_N_augmented <- 1 - fit2[249 / max(heart_valve$fuyrs) * N]
+
+     print(c("ID:", subjects_id[i]))
+     print(c("Base model risk: ", round(risk_N_base, digits = 3)))
+     print(c("Augmented model risk: ", round(risk_N_augmented, digits = 3)))
+}
+```
+
+Provando anche a visualizzare l'evoluzione del rischio nei tre soggetti, per ognuno dei due modelli,
+e confrontandolo con la curva di sopravvivenza del dataset, possiamo notare 
+come le previsioni del modello aumentato diano una sopravvivenza maggiore.
+Questo è in linea con gli indici di rischio a 5 anni, trovati in precedenza.\
+La differenza maggiore a livello di prognosi previste si trova nel 
+soggetto 218, mentre non si notano differenze significative nel 9.
+
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+# Curva di sopravvivenza osservata
+general_surv <- survfit(Surv(fuyrs, status) ~ 1,
+     data = heart_valve
+)$surv
+
+# Modello base: previsione per i 3 soggetti
+plot(general_surv,
+     type = "s", col = 1, ylim = c(0.6, 1), xlim = c(0, 185), lty = 2, lwd = 2,
+     xlab = "time", ylab = "survival probability",
+     main = "Base model"
+)
+for (i in 1:n_centers) {
+     fit <- survfit(model_base, newdata = subjects[i, ])$surv
+     lines(fit, type = "s", lwd = 1.5, col = i + 4)
+}
+
+legend(0.2, 0.8, legend=c("K-M", "Sub. 216", "Sub. 218", "Sub. 9"),
+       col=c(1, 5, 6, 7), lty=c(2, 1, 1, 1), cex=0.8)
+
+# Modello aumentato: previsione per i 3 soggetti
+plot(general_surv,
+     type = "s", col = 1, ylim = c(0.6, 1), xlim = c(0, 185), lty = 2, lwd = 2,
+     xlab = "time", ylab = "survival probability",
+     main = "Augmented model"
+)
+for (i in 1:n_centers) {
+     fit <- survfit(model_augmented, newdata = subjects[i, ])$surv
+     lines(fit, type = "s", lwd = 1.5, col = i + 4)
+}
+
+legend(0.2, 0.8, legend=c("K-M", "Sub. 216", "Sub. 218", "Sub. 9"),
+       col=c(1, 5, 6, 7), lty=c(2, 1, 1, 1), cex=0.8)
+```
+
